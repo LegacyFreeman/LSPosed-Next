@@ -1,0 +1,95 @@
+name: LSPosed-Next CI
+
+on:
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build with Gradle
+        run: |
+          echo 'org.gradle.parallel=true' >> gradle.properties
+          echo 'org.gradle.vfs.watch=true' >> gradle.properties
+          echo 'org.gradle.jvmargs=-Xmx2048m' >> gradle.properties
+          sed -i 's/org.gradle.unsafe.configuration-cache=true//g' gradle.properties
+          ./gradlew zipRelease
+          ./gradlew zipDebug
+
+      - name: Prepare artifact
+        if: success()
+        id: prepareArtifact
+        run: |
+          RELEASE_ZIP=$(ls module/build/outputs/release/LSPosedNext-v*-release.zip)
+          RELEASE_NAME=$(basename "$RELEASE_ZIP" .zip)
+          echo "releaseZip=$RELEASE_ZIP" >> $GITHUB_OUTPUT
+          echo "releaseName=$RELEASE_NAME" >> $GITHUB_OUTPUT
+
+          DEBUG_ZIP=$(ls module/build/outputs/release/LSPosedNext-v*-debug.zip)
+          DEBUG_NAME=$(basename "$DEBUG_ZIP" .zip)
+          echo "debugZip=$DEBUG_ZIP" >> $GITHUB_OUTPUT
+          echo "debugName=$DEBUG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Upload artifacts to GitHub Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepareArtifact.outputs.releaseName }}
+          path: ${{ steps.prepareArtifact.outputs.releaseZip }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepareArtifact.outputs.debugName }}
+          path: ${{ steps.prepareArtifact.outputs.debugZip }}
+
+      - name: Install GitHub CLI
+        run: sudo apt-get update && sudo apt-get install gh -y
+
+      - name: Generate unique tag
+        id: tag
+        run: |
+          TAG="LSPosedNext-v1.0.0-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}-release"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Create or upload GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Creating release with tag ${{ steps.tag.outputs.tag }}"
+          # если релиз уже есть, создаём его игнорируя ошибки
+          gh release create ${{ steps.tag.outputs.tag }} ${{ steps.prepareArtifact.outputs.releaseZip }} --title "Release ${{ steps.tag.outputs.tag }}" --notes "Automated CI release" || true
+          gh release upload ${{ steps.tag.outputs.tag }} ${{ steps.prepareArtifact.outputs.releaseZip }} --clobber
+          gh release upload ${{ steps.tag.outputs.tag }} ${{ steps.prepareArtifact.outputs.debugZip }} --clobber
+
+      - name: Send zip files to Telegram
+        if: success()
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          for file in "${{ steps.prepareArtifact.outputs.releaseZip }}" "${{ steps.prepareArtifact.outputs.debugZip }}"; do
+            if [ -f "$file" ] && [ -s "$file" ]; then
+              echo "Sending $file to Telegram..."
+              curl -v -X POST "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendDocument" \
+                -F chat_id="$TELEGRAM_CHAT_ID" \
+                -F document=@"$file" \
+                -F caption="New build: $(basename "$file")"
+            else
+              echo "Skipping missing or empty file: $file"
+            fi
+          done
